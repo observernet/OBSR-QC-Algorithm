@@ -1,0 +1,442 @@
+/*****************************************************
+ *
+ *****************************************************/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include <profile.h>
+#include <ft_common.h>
+#include <ora_common.h>
+#include <wds_common.h>
+
+#include "PhoneProcessNew.h"
+
+/*************************************************************************************
+ * Start ..
+ *************************************************************************************/
+int main(int argc, char** argv)
+{
+	/* Initialize the server. */
+	/* Open the raw file. */
+	/* Get the processed line number. */
+	/* Read the data and process it. */
+	while ( 1 )
+    {
+    	/* Read the file. */
+						
+			/* Skip the processed data. */
+			/* Parsing incoming data. */
+			/* Pressure data pass. */
+			pdata.QC_PRE = QC_ERROR_OK;
+			
+			/* QC Process */
+			if ( QC_WeatherStatus(WEATHER_STATUS_1ST, &pdata) == -1 )
+			{
+				Log("main: Report QC error! [%s]\n", readbuf);
+				continue;
+			}
+			
+			/* Insert the data into the DB. */
+			/* Record the processed line number. */
+	}
+	
+	interrupt(0);
+	exit(EXIT_SUCCESS);
+}
+
+/**
+ * Parsing the read data.
+ */ 
+int ParsePhoneData(char* buff, PHONE_DATA* pdata)
+{
+	int ptr, len;
+	char token[64];
+	
+	/* Adjust the buffer. */
+	len = strlen(buff);
+	if ( buff[len-1] == '\n' ) buff[len-1] = 0;
+	
+	/* Initialize memory */
+	memset(pdata, 0x00, sizeof(PHONE_DATA));
+	
+	/* Parses the date and time. */
+	if ( buff[0] != '[' || buff[9] != ' ' || buff[16] != ']' || buff[16] == ' ' )
+	{
+		Log("ParseMWSData: Time Setting Error!\n");
+		return (-1);
+	}
+	else
+	{
+		/* Data Time */
+		memcpy(token, buff+1, 8); token[8] = 0;
+		pdata->data_date = atoi(token);
+		
+		memcpy(token, buff+10, 6); token[6] = 0;
+		pdata->data_time = atoi(token);
+	}
+	ptr = 18;
+	
+	/* Parsing data. */
+	PARSE_DATA(user_num, "User unique number", atoi)
+	PARSE_STRING(ip, "IP")
+	PARSE_DATA(lng, "Longitude", atof)
+	PARSE_DATA(lat, "Latitude", atof)
+	PARSE_DATA(PRE, "Pressure", atof)
+	PARSE_CHAR(w_status, "Report")
+	PARSE_CHAR(w_group, "Report Group")
+	
+	return (0);
+}
+/*************************************************************************************
+ * Weather Report QC Processing Function
+ *************************************************************************************/
+/***************************
+ * Proceed with the first QC of the weather report.
+ **************************/
+int QC_WeatherStatus(char step, PHONE_DATA* pdata)
+{
+	char sql[MAX_BUFFER];
+	
+	struct tm tm;
+	time_t timep;
+	char stime[32];
+	
+	double base_x, base_y;
+	time_t base_time;
+	
+	char fv;
+	FDATA fdata[MAX_WEATHER_STATUS];
+	int i, fcount, tcount, ptr;
+	
+	/* DB Usage Registration. */
+		
+	/* Converts the time to UNIX Timestamp. */
+	sprintf(stime, "%08d%06d", pdata->data_date, pdata->data_time);
+	strptime(stime, "%Y%m%d%H%M%S", &tm);
+	timep = mktime(&tm);
+	
+	/* Calculate the reference grid. */
+	if ( step == WEATHER_STATUS_2ND_EXTRA )
+	{
+		base_x = pdata->lat - ((double)((int)(pdata->lat * 1000000) % (int)(GRID_X_EXTRA * 1000000)) / 1000000.0);
+		base_y = pdata->lng - ((double)((int)(pdata->lng * 1000000) % (int)(GRID_Y_EXTRA * 1000000)) / 1000000.0);
+	}
+	else
+	{
+		base_x = pdata->lat - ((double)((int)(pdata->lat * 1000000) % (int)(GRID_X * 1000000)) / 1000000.0);
+		base_y = pdata->lng - ((double)((int)(pdata->lng * 1000000) % (int)(GRID_Y * 1000000)) / 1000000.0);
+	}
+	
+	/* Calculate the reference time. */
+	if ( step == WEATHER_STATUS_1ST )
+	{
+		base_time = (long)timep - (long)(GRID_TIME);
+	}
+	else
+	{
+		base_time = (long)timep + (long)(GRID_TIME);
+	}
+	
+	/* Bring data that meet the conditions. */
+	if ( step == WEATHER_STATUS_2ND_EXTRA )
+	{
+		sprintf(sql, "SELECT NVL(W_GROUP, ' ') "
+					 "FROM OBSERV_PHONE "
+					 "WHERE LONGITUDE between %lf and %lf "
+					 "  and LATITUDE between %lf and %lf ", 
+				 	 base_y, base_y + GRID_Y_EXTRA, base_x, base_x + GRID_X_EXTRA
+		);
+	}
+	else
+	{
+		sprintf(sql, "SELECT NVL(W_GROUP, ' ') "
+					 "FROM OBSERV_PHONE "
+					 "WHERE LONGITUDE between %lf and %lf "
+					 "  and LATITUDE between %lf and %lf ", 
+				 	 base_y, base_y + GRID_Y, base_x, base_x + GRID_X
+		);
+	}
+	if ( step == WEATHER_STATUS_1ST )
+	{
+		ptr = strlen(sql);
+		sprintf(&sql[ptr], "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", (long)base_time, (long)timep);
+	}
+	else
+	{
+		ptr = strlen(sql);
+		sprintf(&sql[ptr], "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", (long)timep, (long)base_time);
+	}
+	
+	/* Run the query. */
+	EXEC SQL PREPARE _WEATHER_STATUS_S FROM :sql;
+	EXEC SQL DECLARE _WEATHER_STATUS CURSOR FOR _WEATHER_STATUS_S;
+	
+	EXEC SQL OPEN _WEATHER_STATUS;
+	if ( _SQLOK )
+	{
+		tcount = fcount = 0;
+		memset(fdata, 0x00, sizeof(FDATA)*MAX_WEATHER_STATUS);
+		
+		/* Add own data. */
+		fdata[fcount].status = pdata->w_group;
+		fdata[fcount].count++;
+		fcount++;
+		tcount++;
+		
+		while ( 1 )
+		{
+			EXEC SQL FETCH _WEATHER_STATUS INTO :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv == ' ' ) continue;
+ 			
+ 			for ( i = 0 ; i < fcount ; i++ )
+ 			{
+ 				if ( fdata[i].status == fv )
+ 				{
+ 					fdata[i].count++;
+ 					break;
+ 				}
+ 			}
+ 			if ( i >= fcount )
+ 			{
+ 				fdata[fcount].status = fv;
+ 				fdata[fcount].count = 1;
+ 				fcount++;
+ 			}
+ 			
+ 			tcount++;
+		}
+	}
+	else
+	{
+		sprintf(pdata->QC_W_ERR, "An error occurred while importing grid data.");
+ 		Log("QC_WeatherStatus: %s sqlcode[%d]\n", pdata->QC_W_ERR, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _WEATHER_STATUS;
+	
+	pdata->QC_W = QC_ERROR_COMMON;
+	sprintf(pdata->QC_W_ERR, "STEP[%c] TOTAL[%d] FCOUNT[%d] data[%c]", step, tcount, fcount, pdata->w_group);
+	
+	/* Determine whether QC is available. */
+	if ( tcount > 4 )
+	{
+		double my_rate = 0.0;
+		
+		/* Bring in the reporting rate of the group. */
+		for ( i = 0 ; i < fcount ; i++ )
+		{
+			if ( fdata[i].status == pdata->w_group )
+			{
+				my_rate = (double)fdata[i].count / (double)tcount;
+				break;
+			}
+		}
+		
+		if ( my_rate >= 0.38 )
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+		else
+		{
+			ptr = strlen(pdata->QC_W_ERR);
+			sprintf(&pdata->QC_W_ERR[ptr], " my_rate[%.2lf]", my_rate*100);
+		}
+	}
+	else if ( tcount == 4 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+		else if ( fcount == 2 )
+		{
+			/* Sort the data. */
+			qsort(fdata, fcount, sizeof(FDATA), _qsort_wstatus);
+			
+			if ( fdata[0].count == 2 )
+			{
+				pdata->QC_W = QC_ERROR_OK;
+			}
+			
+			if ( fdata[0].count == 3 && fdata[0].status == pdata->w_group )
+			{
+				pdata->QC_W = QC_ERROR_OK;
+			}
+			
+			if ( pdata->QC_W != QC_ERROR_OK )
+			{
+				ptr = strlen(pdata->QC_W_ERR);
+				sprintf(&pdata->QC_W_ERR[ptr], " s1[%c:%d] s2[%c:%d]", fdata[0].status, fdata[0].count, fdata[1].status, fdata[1].count);
+			}
+		}
+	}
+	else if ( tcount == 3 )
+	{
+		if ( fcount == 1 )
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+		else if ( fcount == 2 )
+		{
+			/* Sort the data. */
+			qsort(fdata, fcount, sizeof(FDATA), _qsort_wstatus);
+			
+			if ( fdata[0].count == 2 && fdata[0].status == pdata->w_group )
+			{
+				pdata->QC_W = QC_ERROR_OK;
+			}
+			
+			if ( pdata->QC_W != QC_ERROR_OK )
+			{
+				ptr = strlen(pdata->QC_W_ERR);
+				sprintf(&pdata->QC_W_ERR[ptr], " s1[%c:%d] s2[%c:%d]", fdata[0].status, fdata[0].count, fdata[1].status, fdata[1].count);
+			}
+		}
+		else
+		{
+			if ( step == WEATHER_STATUS_1ST )
+			{
+				pdata->QC_W = QC_ERROR_SPEC;
+			}
+		}
+	}
+	else
+	{
+		if ( step == WEATHER_STATUS_1ST )
+		{
+			pdata->QC_W = QC_ERROR_SPEC;
+		}
+		else
+		{
+			pdata->QC_W = QC_ERROR_OK;
+		}
+	}
+	
+	return (0);
+}
+
+/***************************
+ * Proceed with the second QC of the weather report.
+ ***************************/
+int	ProcessWeatherStatus2nd(time_t ftime)
+{
+	char sql[MAX_BUFFER];
+	int count = 0;
+	PHONE_DATA pdata;
+	/* DB usage registration.*/
+	/* Get the target data. */
+	sprintf(sql, "SELECT DATA_DATE, DATE_IDX, DATA_TIME, LONGITUDE, LATITUDE, W_STATUS, W_GROUP, QC_W"
+				 "FROM OBSERV_PHONE "
+				 "WHERE QC_W in ('S', 'A', 'a') "
+				 "  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) <= %ld ", (long)ftime);	
+	//Log("[%ld][%d]\n", (long)ftime, intTimeFrom(ftime));
+	/* Run the query. */
+	EXEC SQL PREPARE _FETCH_PHONE_DATA_S FROM :sql;
+	EXEC SQL DECLARE _FETCH_PHONE_DATA CURSOR FOR _FETCH_PHONE_DATA_S;
+	EXEC SQL OPEN _FETCH_PHONE_DATA;
+	if ( _SQLOK )
+	{
+		while ( 1 )
+		{
+			memset(&pdata, 0x00, sizeof(PHONE_DATA));
+			
+			EXEC SQL FETCH _FETCH_PHONE_DATA INTO :pdata.data_date,
+												  :pdata.date_idx,
+												  :pdata.data_time,
+												  :pdata.lng,
+												  :pdata.lat,
+												  :pdata.w_status,
+												  :pdata.w_group,
+												  :pdata.f_QC_W;
+			if ( _SQLNOTFOUND ) break;
+				
+			Log("ProcessWeatherStatus2nd: Fetch Data data_time[%d:%d] latlng[%lf:%lf] w_status[%c:%c] QC[%c]\n", pdata.data_date, pdata.data_time, pdata.lat, pdata.lng, pdata.w_status, pdata.w_group, pdata.f_QC_W);
+			
+			/* If it was Again at the existing processing stage, the entity shall re-execute QC. */
+			if ( pdata.f_QC_W == 'A' )
+			{
+				if ( QC_WeatherStatus(WEATHER_STATUS_2ND, &pdata) == -1 )
+				{
+					Log("ProcessWeatherStatus2nd: Report QC error!\n");
+					count = 0;
+					break;
+				}
+			}
+			else if ( pdata.f_QC_W == 'a' )
+			{
+				if ( QC_WeatherStatus(WEATHER_STATUS_2ND_EXTRA, &pdata) == -1 )
+				{
+					Log("ProcessWeatherStatus2nd: Report QC error!\n");
+					count = 0;
+					break;
+				}
+			}
+			else
+				pdata.QC_W = QC_ERROR_OK;
+			
+			/* Update the data. */
+			if ( UpdatePhoneData(&pdata) == -1 )
+			{
+				Log("ProcessWeatherStatus2nd: Data Renewal Error!\n");
+				count = 0;
+				break;;
+			}
+			
+			count++;
+		}
+	}
+	else
+	{
+ 		Log("ProcessWeatherStatus2nd: Error retrieving target data! sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _FETCH_PHONE_DATA;
+	
+	if ( count > 0 )
+	{
+		EXEC SQL COMMIT;
+	}
+	else
+	{
+		EXEC SQL ROLLBACK;
+	}
+	
+	return (0);
+}
+/*************************************************************************************
+ * DB Processing Functions
+ *************************************************************************************/
+/**
+ * Insert processed data into DB.
+ */
+ 	/* Save the data. */
+
+ 	/* Record the QC error. */
+
+	/* Update counter information. */
+/**
+ * Update the processed data.
+ */
+/*************************************************************************************
+ * Initialization Functions
+ *************************************************************************************/
+/**
+ * Initialize the server.
+ */ 
+
+/**
+ * Shut down the server.
+ */
